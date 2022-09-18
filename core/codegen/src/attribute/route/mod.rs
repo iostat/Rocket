@@ -2,16 +2,19 @@ mod parse;
 
 use std::hash::Hash;
 
-use devise::{Spanned, SpanWrapped, Result, FromMeta, Diagnostic};
 use devise::ext::TypeExt as _;
-use proc_macro2::{TokenStream, Span};
+use devise::{Diagnostic, FromMeta, Result, SpanWrapped, Spanned};
+use proc_macro2::{Span, TokenStream};
+use syn::punctuated::Punctuated;
+use syn::token::Comma;
+use syn::GenericParam;
 
+use crate::attribute::param::Guard;
+use crate::http_codegen::{Method, Optional};
 use crate::proc_macro_ext::StringLit;
 use crate::syn_ext::{IdentExt, TypeExt as _};
-use crate::http_codegen::{Method, Optional};
-use crate::attribute::param::Guard;
 
-use self::parse::{Route, Attribute, MethodAttribute};
+use self::parse::{Attribute, MethodAttribute, Route};
 
 impl Route {
     pub fn guards(&self) -> impl Iterator<Item = &Guard> {
@@ -42,22 +45,25 @@ fn query_decls(route: &Route) -> Option<TokenStream> {
     );
 
     // Record all of the static parameters for later filtering.
-    let (raw_name, raw_value) = route.query_params.iter()
+    let (raw_name, raw_value) = route
+        .query_params
+        .iter()
         .filter_map(|s| s.r#static())
         .map(|name| match name.find('=') {
             Some(i) => (&name[..i], &name[i + 1..]),
-            None => (name.as_str(), "")
+            None => (name.as_str(), ""),
         })
         .split2();
 
     // Now record all of the dynamic parameters.
-    let (name, matcher, ident, init_expr, push_expr, finalize_expr) = route.query_guards()
+    let (name, matcher, ident, init_expr, push_expr, finalize_expr) = route
+        .query_guards()
         .map(|guard| {
             let (name, ty) = (&guard.name, &guard.ty);
             let ident = guard.fn_ident.rocketized().with_span(ty.span());
             let matcher = match guard.trailing {
                 true => quote_spanned!(name.span() => _),
-                _ => quote!(#name)
+                _ => quote!(#name),
             };
 
             define_spanned_export!(ty.span() => FromForm, _form);
@@ -198,7 +204,8 @@ fn data_guard_decl(guard: &Guard) -> TokenStream {
 
 fn internal_uri_macro_decl(route: &Route) -> TokenStream {
     // FIXME: Is this the right order? Does order matter?
-    let uri_args = route.param_guards()
+    let uri_args = route
+        .param_guards()
         .chain(route.query_guards())
         .map(|guard| (&guard.fn_ident, &guard.ty))
         .map(|(ident, ty)| quote!(#ident: #ty));
@@ -231,14 +238,38 @@ fn internal_uri_macro_decl(route: &Route) -> TokenStream {
 fn responder_outcome_expr(route: &Route) -> TokenStream {
     let ret_span = match route.handler.sig.output {
         syn::ReturnType::Default => route.handler.sig.ident.span(),
-        syn::ReturnType::Type(_, ref ty) => ty.span()
+        syn::ReturnType::Type(_, ref ty) => ty.span(),
     };
 
-    let user_handler_fn_name = &route.handler.sig.ident;
-    let parameter_names = route.arguments.map.values()
+    let user_handler_fn_name = if route.handler.sig.generics.params.is_empty() {
+        let ident = &route.handler.sig.ident;
+        quote!(#ident)
+    } else {
+        let ident = &route.handler.sig.ident;
+        let generics = route
+            .handler
+            .sig
+            .generics
+            .params
+            .clone()
+            .into_iter()
+            .filter_map(|p| match p {
+                GenericParam::Type(syn::TypeParam { ident, .. }) => Some(ident),
+                _ => None,
+            })
+            .collect::<Punctuated<_, Comma>>();
+        quote!(#ident :: <#generics>)
+    };
+    let parameter_names = route
+        .arguments
+        .map
+        .values()
         .map(|(ident, _)| ident.rocketized());
 
-    let _await = route.handler.sig.asyncness
+    let _await = route
+        .handler
+        .sig
+        .asyncness
         .map(|a| quote_spanned!(a.span() => .await));
 
     define_spanned_export!(ret_span => __req, _route);
@@ -251,10 +282,13 @@ fn responder_outcome_expr(route: &Route) -> TokenStream {
 fn sentinels_expr(route: &Route) -> TokenStream {
     let ret_ty = match route.handler.sig.output {
         syn::ReturnType::Default => None,
-        syn::ReturnType::Type(_, ref ty) => Some(ty.with_stripped_lifetimes())
+        syn::ReturnType::Type(_, ref ty) => Some(ty.with_stripped_lifetimes()),
     };
 
-    let generic_idents: Vec<_> = route.handler.sig.generics
+    let generic_idents: Vec<_> = route
+        .handler
+        .sig
+        .generics
         .type_params()
         .map(|p| &p.ident)
         .collect();
@@ -285,11 +319,12 @@ fn sentinels_expr(route: &Route) -> TokenStream {
 
         match syn::parse2(tokens.clone()).ok()? {
             Input::Type(ty, ..) => Some(ty),
-            Input::Tokens(..) => None
+            Input::Tokens(..) => None,
         }
     }
 
-    let eligible_types = route.guards()
+    let eligible_types = route
+        .guards()
         .map(|guard| &guard.ty)
         .chain(ret_ty.as_ref().into_iter())
         .flat_map(|ty| ty.unfold_with_ty_macros(TY_MACS, ty_mac_mapper))
@@ -324,7 +359,47 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
 
     // Gather info about the function.
     let (vis, handler_fn) = (&route.handler.vis, &route.handler);
-    let handler_fn_name = &handler_fn.sig.ident;
+    let (handler_fn_name, impl_generics, bare_generic_idents, phantoms, phantom_values) =
+        if handler_fn.sig.generics.params.is_empty() {
+            let ident = handler_fn.sig.ident.clone();
+            (ident, None, None, Default::default(), Default::default())
+        } else {
+            let ident = handler_fn.sig.ident.clone();
+            let generics = handler_fn.sig.generics.clone();
+            let generic_idents = generics
+                .params
+                .iter()
+                .filter_map(|p| match p {
+                    GenericParam::Type(syn::TypeParam { ident, .. }) => Some(ident.clone()),
+                    _ => None,
+                })
+                .collect::<Punctuated<_, Comma>>();
+            let phantoms = generic_idents
+                .iter()
+                .map(|i| {
+                    let phantom_ident =
+                        syn::Ident::new(&format!("phantom_{}", i.to_string()), i.span());
+                    let phantom_type = i.clone();
+                    quote!(#phantom_ident : ::std::marker::PhantomData<#phantom_type>)
+                })
+                .collect::<Punctuated<_, Comma>>();
+            let phantom_values = generic_idents
+                .iter()
+                .map(|i| {
+                    let phantom_ident =
+                        syn::Ident::new(&format!("phantom_{}", i.to_string()), i.span());
+                    quote!(#phantom_ident : ::std::marker::PhantomData)
+                })
+                .collect::<Punctuated<_, Comma>>();
+            (
+                ident,
+                Some(generics),
+                Some(quote!(#generic_idents)),
+                phantoms,
+                phantom_values,
+            )
+        };
+    let generic_idents = bare_generic_idents.clone().map(|gi| quote!(< #gi >));
     let internal_uri_macro = internal_uri_macro_decl(&route);
     let responder_outcome = responder_outcome_expr(&route);
 
@@ -333,19 +408,38 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
     let rank = Optional(route.attr.rank);
     let format = Optional(route.attr.format.as_ref());
 
+    let monomorphized_function_generics = [quote!('__r)]
+        .into_iter()
+        .chain(
+            impl_generics
+                .clone()
+                .map(|syn::Generics { params, .. }| quote!(#params)),
+        )
+        .collect::<Punctuated<_, Comma>>();
+    let monomorphized_function_handler_generics = generic_idents.clone().map(|i| quote!(:: #i));
+
     Ok(quote! {
         #handler_fn
 
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
         /// Rocket code generated proxy structure.
-        #vis struct #handler_fn_name {  }
+        #vis struct #handler_fn_name #generic_idents { #phantoms }
+
+        #[doc(hidden)]
+        impl #impl_generics ::std::default::Default for #handler_fn_name #generic_idents {
+            fn default() -> Self {
+                Self {
+                    #phantom_values
+                }
+            }
+        }
 
         /// Rocket code generated proxy static conversion implementations.
-        impl #handler_fn_name {
+        impl #impl_generics #handler_fn_name #generic_idents {
             #[allow(non_snake_case, unreachable_patterns, unreachable_code)]
             fn into_info(self) -> #_route::StaticInfo {
-                fn monomorphized_function<'__r>(
+                fn monomorphized_function < #monomorphized_function_generics > (
                     #__req: &'__r #Request<'_>,
                     #__data: #Data<'__r>
                 ) -> #_route::BoxFuture<'__r> {
@@ -363,7 +457,7 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                     name: stringify!(#handler_fn_name),
                     method: #method,
                     uri: #uri,
-                    handler: monomorphized_function,
+                    handler: monomorphized_function #monomorphized_function_handler_generics,
                     format: #format,
                     rank: #rank,
                     sentinels: #sentinels,
@@ -394,7 +488,7 @@ fn complete_route(args: TokenStream, input: TokenStream) -> Result<TokenStream> 
 fn incomplete_route(
     method: crate::http::Method,
     args: TokenStream,
-    input: TokenStream
+    input: TokenStream,
 ) -> Result<TokenStream> {
     let method_str = method.to_string().to_lowercase();
     // FIXME(proc_macro): there should be a way to get this `Span`.
@@ -412,7 +506,10 @@ fn incomplete_route(
 
     let attribute = Attribute {
         method: SpanWrapped {
-            full_span: method_span, key_span: None, span: method_span, value: Method(method)
+            full_span: method_span,
+            key_span: None,
+            span: method_span,
+            value: Method(method),
         },
         uri: method_attribute.uri,
         data: method_attribute.data,
@@ -426,11 +523,11 @@ fn incomplete_route(
 pub fn route_attribute<M: Into<Option<crate::http::Method>>>(
     method: M,
     args: proc_macro::TokenStream,
-    input: proc_macro::TokenStream
+    input: proc_macro::TokenStream,
 ) -> TokenStream {
     let result = match method.into() {
         Some(method) => incomplete_route(method, args.into(), input.into()),
-        None => complete_route(args.into(), input.into())
+        None => complete_route(args.into(), input.into()),
     };
 
     result.unwrap_or_else(|diag| diag.emit_as_item_tokens())
