@@ -1497,3 +1497,11 @@ pub fn internal_guide_tests(input: TokenStream) -> TokenStream {
 pub fn export(input: TokenStream) -> TokenStream {
     emit!(bang::export_internal(input))
 }
+
+
+#[proc_macro_attribute]
+/// Generates a set of routes for a trait
+pub fn rocket_routes(args: TokenStream, input: TokenStream) -> TokenStream {
+    emit!(attribute::route::trait_attribute(args, input))
+}
+

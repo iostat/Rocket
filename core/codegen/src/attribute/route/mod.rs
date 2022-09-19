@@ -2,7 +2,7 @@ mod parse;
 
 use std::hash::Hash;
 
-use devise::ext::TypeExt as _;
+use devise::ext::{PathExt, TypeExt as _};
 use devise::{Diagnostic, FromMeta, Result, SpanWrapped, Spanned};
 use proc_macro2::{Span, TokenStream};
 use syn::punctuated::Punctuated;
@@ -10,6 +10,7 @@ use syn::token::Comma;
 use syn::GenericParam;
 
 use crate::attribute::param::Guard;
+use crate::http;
 use crate::http_codegen::{Method, Optional};
 use crate::proc_macro_ext::StringLit;
 use crate::syn_ext::{IdentExt, TypeExt as _};
@@ -345,7 +346,7 @@ fn sentinels_expr(route: &Route) -> TokenStream {
     quote!(::std::vec![#(#sentinel),*])
 }
 
-fn codegen_route(route: Route) -> Result<TokenStream> {
+fn codegen_route(route: Route, generic_trampoline_real_name: Option<syn::Ident>) -> Result<TokenStream> {
     use crate::exports::*;
 
     // Generate the declarations for all of the guards.
@@ -359,10 +360,11 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
 
     // Gather info about the function.
     let (vis, handler_fn) = (&route.handler.vis, &route.handler);
-    let (handler_fn_name, impl_generics, bare_generic_idents, phantoms, phantom_values) =
+    let (handler_fn_name, static_info_name, impl_generics, bare_generic_idents, phantoms, phantom_values) =
         if handler_fn.sig.generics.params.is_empty() {
             let ident = handler_fn.sig.ident.clone();
-            (ident, None, None, Default::default(), Default::default())
+            let static_info_name = quote!(String::from(::std::any::type_name::<#ident>()));
+            (ident, static_info_name, None, None, Default::default(), Default::default())
         } else {
             let ident = handler_fn.sig.ident.clone();
             let generics = handler_fn.sig.generics.clone();
@@ -374,6 +376,7 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                     _ => None,
                 })
                 .collect::<Punctuated<_, Comma>>();
+
             let phantoms = generic_idents
                 .iter()
                 .map(|i| {
@@ -391,8 +394,15 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                     quote!(#phantom_ident : ::std::marker::PhantomData)
                 })
                 .collect::<Punctuated<_, Comma>>();
+            let generic_trampoline_real_name = generic_trampoline_real_name.unwrap_or(ident.clone());
+            let first_generic_ident = generic_idents.first().cloned().unwrap_or(syn::parse_str("Any").unwrap());
+            let generic_trampoline_real_name_str = generic_trampoline_real_name.to_string();
+            let gen_static_info_name = quote!(
+                format!("{}:{}", ::std::any::type_name::< #first_generic_ident >(), #generic_trampoline_real_name_str)
+            );
             (
                 ident,
+                gen_static_info_name,
                 Some(generics),
                 Some(quote!(#generic_idents)),
                 phantoms,
@@ -423,6 +433,7 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
 
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
+        #[allow(non_snake_case)]
         /// Rocket code generated proxy structure.
         #vis struct #handler_fn_name #generic_idents { #phantoms }
 
@@ -454,7 +465,7 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                 }
 
                 #_route::StaticInfo {
-                    name: stringify!(#handler_fn_name),
+                    name: #static_info_name,
                     method: #method,
                     uri: #uri,
                     handler: monomorphized_function #monomorphized_function_handler_generics,
@@ -482,7 +493,7 @@ fn complete_route(args: TokenStream, input: TokenStream) -> Result<TokenStream> 
 
     let attr_tokens = quote!(route(#args));
     let attribute = Attribute::from_meta(&syn::parse2(attr_tokens)?)?;
-    codegen_route(Route::from(attribute, function)?)
+    codegen_route(Route::from(attribute, function)?, None)
 }
 
 fn incomplete_route(
@@ -517,7 +528,7 @@ fn incomplete_route(
         rank: method_attribute.rank,
     };
 
-    codegen_route(Route::from(attribute, function)?)
+    codegen_route(Route::from(attribute, function)?, None)
 }
 
 pub fn route_attribute<M: Into<Option<crate::http::Method>>>(
@@ -531,4 +542,203 @@ pub fn route_attribute<M: Into<Option<crate::http::Method>>>(
     };
 
     result.unwrap_or_else(|diag| diag.emit_as_item_tokens())
+}
+
+pub fn trait_attribute(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> TokenStream {
+    let _ = syn::parse2::<syn::parse::Nothing>(args.into()).unwrap();
+    let input = syn::parse2::<syn::ItemTrait>(input.into()).unwrap();
+
+    let vis = input.vis;
+    let trait_name = input.ident;
+    let mut supertraits = input.supertraits;
+    supertraits.push(syn::TypeParamBound::Trait(syn::TraitBound {
+        paren_token: None,
+        modifier: syn::TraitBoundModifier::None,
+        lifetimes: None,
+        path: syn::parse_str("::std::any::Any").unwrap(),
+    }));
+    supertraits.push(syn::TypeParamBound::Trait(syn::TraitBound {
+        paren_token: None,
+        modifier: syn::TraitBoundModifier::None,
+        lifetimes: None,
+        path: syn::parse_str("::std::marker::Sized").unwrap(),
+    }));
+    supertraits.push(syn::TypeParamBound::Lifetime(syn::Lifetime::new("'static", Span::call_site())));
+
+    let normalize_route_attr = |a: &syn::Attribute| {
+        static METHODS: [(&str, http::Method); 7] = [
+            ("get", http::Method::Get),
+            ("put", http::Method::Put),
+            ("post", http::Method::Post),
+            ("delete", http::Method::Delete),
+            ("head", http::Method::Head),
+            ("patch", http::Method::Patch),
+            ("options", http::Method::Options),
+        ];
+        let is_method_attr = |seg| a.path.is_local(&[seg])
+            || a.path.is_global(&["rocket", seg])
+            || a.path.is_local(&["rocket", seg]);
+        let find_method_attr = ||
+            METHODS.iter()
+                .filter_map(|(s, m)| if is_method_attr(s) { Some(m.clone()) } else { None })
+                .next();
+
+        let args = &a.tokens;
+        syn::parse2(quote!(route #args)).ok().and_then(|route_meta|
+            Attribute::from_meta(&route_meta).ok()
+                .or_else(||
+                    find_method_attr().and_then(|m| {
+                        let as_ident = syn::Ident::new(&m.to_string().to_lowercase(), Span::call_site());
+                        syn::parse2(quote!(#as_ident #args)).ok().and_then(|method_attr_meta| {
+                            MethodAttribute::from_meta(&method_attr_meta).ok().map(|ma| {
+                                Attribute {
+                                    method: SpanWrapped {
+                                        span: Span::call_site(),
+                                        key_span: None,
+                                        full_span: Span::call_site(),
+                                        value: Method(m)
+                                    },
+                                    uri: ma.uri,
+                                    data: ma.data,
+                                    format: ma.format,
+                                    rank: ma.rank,
+                                }
+                            })
+                        })
+                    })
+                )
+        )
+    };
+
+    let route_impl_generic = syn::Ident::new(&format!("TImpl{}", trait_name), trait_name.span());
+    let mut route_impl_items = vec![];
+    let filtered_trait_items = input
+        .items
+        .clone()
+        .into_iter()
+        .map(|mut ti| {
+            if let syn::TraitItem::Method(ref mut tim) = ti {
+                route_impl_items.push(tim.clone());
+                let filtered_attrs = tim
+                    .attrs
+                    .clone()
+                    .into_iter()
+                    .filter_map(|a| if normalize_route_attr(&a).is_none() { Some(a) } else { None })
+                    .collect();
+                tim.attrs = filtered_attrs;
+            }
+
+            ti
+        })
+        .collect::<Vec<_>>();
+
+    let push_sig_generic = |sig: &mut syn::Signature| {
+        let type_param = GenericParam::Type(syn::TypeParam {
+            attrs: vec![],
+            ident: route_impl_generic.clone(),
+            colon_token: Some(Default::default()),
+            bounds: vec![syn::TypeParamBound::Trait(syn::TraitBound {
+                paren_token: None,
+                modifier: syn::TraitBoundModifier::None,
+                lifetimes: None,
+                path: trait_name.clone().into(),
+            })]
+                .into_iter()
+                .collect(),
+            eq_token: None,
+            default: None,
+        });
+        sig.generics.params.push(type_param);
+    };
+
+    let trampoline_struct_name = syn::Ident::new(
+        &format!("{}Trampoline", trait_name),
+        trait_name.span().into(),
+    );
+
+    let mut trampoline_idents = vec![];
+
+    let trampoline_items = route_impl_items
+        .into_iter()
+        .map(|syn::TraitItemMethod { attrs, mut sig, .. }| {
+            use std::ops::Deref;
+            push_sig_generic(&mut sig);
+            let original_path = sig.ident.clone();
+            let trampoline = syn::Ident::new(&format!("trampoline_{}", original_path), original_path.span().into());
+            sig.ident = trampoline.clone();
+            let args = sig
+                .inputs
+                .iter()
+                .map(|arg| match arg {
+                    syn::FnArg::Receiver(_) => {
+                        panic!("Rocket trait routes with receiver arguments are invalid!")
+                    }
+                    syn::FnArg::Typed(syn::PatType { pat, .. }) => match pat.deref() {
+                        syn::Pat::Ident(syn::PatIdent { ident, .. }) => syn::Expr::Path(syn::ExprPath {
+                            attrs: vec![],
+                            qself: None,
+                            path: ident.clone().into(),
+                        }),
+                        x => panic!("Unsupported arg {:#?}", x),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let stmt = quote!(
+                return <#route_impl_generic as #trait_name>::#original_path(#(#args),*);
+            );
+            let stmts = vec![syn::parse2(stmt).unwrap()];
+            let block = Box::new(syn::Block {
+                brace_token: Default::default(),
+                stmts,
+            });
+
+            let mut kept_attrs = vec![];
+            let mut codegen_attrs = vec![];
+
+            for attr in attrs {
+                match normalize_route_attr(&attr) {
+                    Some(ra) => codegen_attrs.push(ra),
+                    None => kept_attrs.push(attr),
+                }
+            }
+
+            trampoline_idents.push(quote!(#trampoline::<#route_impl_generic>));
+
+            let fn_item = syn::ItemFn {
+                attrs: kept_attrs,
+                sig,
+                block,
+                vis: syn::Visibility::Inherited,
+            };
+
+
+            codegen_attrs.into_iter()
+                .map(|ra| codegen_route(Route::from(ra, fn_item.clone()).unwrap(), Some(original_path.clone())).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let res = quote!(
+        #vis trait #trait_name: #supertraits {
+            #(#filtered_trait_items)*
+
+            fn routes() -> ::std::vec::Vec<::rocket::Route> {
+                #trampoline_struct_name(::std::marker::PhantomData::<Self>).into()
+            }
+        }
+        struct #trampoline_struct_name<T: #trait_name>(::std::marker::PhantomData<T>);
+        const _: () = {
+            #(#trampoline_items)*
+
+            impl<#route_impl_generic: #trait_name> From<#trampoline_struct_name<#route_impl_generic>> for ::std::vec::Vec<::rocket::Route> {
+                fn from(_: #trampoline_struct_name<#route_impl_generic>) -> Self {
+                    ::rocket::routes![#(#trampoline_idents),*]
+                }
+            }
+
+            ()
+        };
+    );
+    res.into()
 }
