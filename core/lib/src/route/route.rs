@@ -333,7 +333,7 @@ impl fmt::Debug for Route {
 #[doc(hidden)]
 pub struct StaticInfo {
     /// The route's name, i.e, the name of the function.
-    pub name: &'static str,
+    pub name: String,
     /// The route's method.
     pub method: Method,
     /// The route's URi, without the base mount point.
