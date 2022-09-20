@@ -610,6 +610,7 @@ pub fn trait_attribute(args: proc_macro::TokenStream, input: proc_macro::TokenSt
         )
     };
 
+    let mut async_trait = false;
     let route_impl_generic = syn::Ident::new(&format!("TImpl{}", trait_name), trait_name.span());
     let mut route_impl_items = vec![];
     let filtered_trait_items = input
@@ -618,7 +619,10 @@ pub fn trait_attribute(args: proc_macro::TokenStream, input: proc_macro::TokenSt
         .into_iter()
         .map(|mut ti| {
             if let syn::TraitItem::Method(ref mut tim) = ti {
+
+                async_trait |= tim.sig.asyncness.is_some();
                 route_impl_items.push(tim.clone());
+
                 let filtered_attrs = tim
                     .attrs
                     .clone()
@@ -631,6 +635,8 @@ pub fn trait_attribute(args: proc_macro::TokenStream, input: proc_macro::TokenSt
             ti
         })
         .collect::<Vec<_>>();
+
+    let async_trait = if async_trait { quote!(#[::rocket::async_trait]) } else { quote!() };
 
     let push_sig_generic = |sig: &mut syn::Signature| {
         let type_param = GenericParam::Type(syn::TypeParam {
@@ -683,8 +689,9 @@ pub fn trait_attribute(args: proc_macro::TokenStream, input: proc_macro::TokenSt
                     },
                 })
                 .collect::<Vec<_>>();
+            let _await = if sig.asyncness.is_some() { quote!(.await) } else { quote!() };
             let stmt = quote!(
-                return <#route_impl_generic as #trait_name>::#original_path(#(#args),*);
+                return <#route_impl_generic as #trait_name>::#original_path(#(#args),*) #_await;
             );
             let stmts = vec![syn::parse2(stmt).unwrap()];
             let block = Box::new(syn::Block {
@@ -720,6 +727,7 @@ pub fn trait_attribute(args: proc_macro::TokenStream, input: proc_macro::TokenSt
         .collect::<Vec<_>>();
 
     let res = quote!(
+        #async_trait
         #vis trait #trait_name: #supertraits {
             #(#filtered_trait_items)*
 
